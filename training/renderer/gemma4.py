@@ -690,3 +690,172 @@ def _gemma4_factory(tokenizer: Tokenizer, image_processor=None) -> Gemma4Rendere
 
 
 register_renderer("gemma4", _gemma4_factory)
+
+
+# ---------------------------------------------------------------------------
+# Thinking-aware variant
+# ---------------------------------------------------------------------------
+
+
+class Gemma4ThinkingRenderer(Gemma4Renderer):
+    """Gemma 4 renderer with thinking enabled and ``reasoning_content`` rendering.
+
+    Two differences from the base ``Gemma4Renderer``:
+
+    1. ``enable_thinking`` defaults to ``True`` — the ``<|think|>`` marker is
+       injected at the top of the first system turn, matching the official
+       template's ``enable_thinking=true`` argument. This gates the
+       thinking-mode generation behavior in compatible Gemma 4 deployments.
+
+    2. Assistant messages with a ``reasoning_content`` field have that text
+       wrapped in ``<|channel>...<channel|>`` and emitted at the start of the
+       turn body, before any ``tool_calls`` or visible ``content``. This
+       mirrors the same render → sample → parse round-trip the base renderer
+       already supports for ``ThinkingPart`` content blocks
+       (see ``parse_response``: the parser already splits
+       ``<|channel>...<channel|>`` blocks back out into ``ThinkingPart``s).
+
+       Three input shapes are accepted, matching ``deepseek_v4`` conventions:
+       a top-level ``reasoning_content`` string (preferred), an existing
+       ``ThinkingPart`` already in the structured ``content`` list (passthrough),
+       or a raw string ``content`` with ``<|channel>...<channel|>`` already
+       embedded (passthrough — the base renderer's per-turn ``strip_thinking``
+       runs only on prior turns during prefill, not on the message currently
+       being rendered).
+
+    With ``content`` already containing channel blocks, this subclass is a
+    no-op on that message — it only wraps ``reasoning_content`` when the
+    field is present and the visible content does not already carry a
+    channel block. Tool calls and tool responses are untouched.
+    """
+
+    def __init__(self, tokenizer: Tokenizer, *, enable_thinking: bool = True):
+        super().__init__(tokenizer, enable_thinking=enable_thinking)
+
+    @staticmethod
+    def _has_channel_block(content: Any) -> bool:
+        if isinstance(content, str):
+            return _CHANNEL_OPEN in content
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "thinking":
+                        return True
+                    if part.get("type") == "text" and _CHANNEL_OPEN in (part.get("text") or ""):
+                        return True
+        return False
+
+    def render_message(self, message: Message, ctx: RenderContext) -> RenderedMessage:
+        """Render an assistant turn with reasoning emitted as a
+        ``<|channel>...<channel|>`` block before the tool calls and visible
+        content::
+
+            <|turn>model
+            <|channel>{reasoning}<channel|>{tool_calls}{tool_responses}{content}<turn|>
+
+        Three input shapes are accepted:
+
+        1. ``message['reasoning_content']`` is a non-empty string — wrap it
+           in ``<|channel>...<channel|>`` directly.
+        2. ``message['content']`` is a string already containing
+           ``<|channel>...<channel|>`` — pass through (the base renderer's
+           ``_strip_thinking`` would normally remove channel blocks here, so
+           we re-emit them ourselves to preserve the caller's text).
+        3. ``message['content']`` is a structured list with a ``ThinkingPart``
+           — pass through as-is, emitting the thinking part as a channel
+           block.
+
+        Visible content is also passed through verbatim (no
+        ``_strip_thinking`` filtering), since for the message currently being
+        rendered the channel block IS the reasoning we want trained on.
+
+        Non-assistant messages delegate to the base renderer unchanged.
+        """
+        if message.get("role") != "assistant":
+            return super().render_message(message, ctx)
+        del ctx
+
+        # Extract reasoning text from any of the three accepted shapes.
+        reasoning_text = ""
+        visible_text = ""
+        content = message.get("content")
+        explicit = message.get("reasoning_content")
+        if isinstance(explicit, str) and explicit.strip():
+            reasoning_text = explicit.strip()
+            visible_text = content if isinstance(content, str) else ""
+            if isinstance(content, list):
+                visible_text = "".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "thinking":
+                    if reasoning_text:
+                        reasoning_text += part.get("thinking", "")
+                    else:
+                        reasoning_text = part.get("thinking", "") or ""
+                elif ptype == "text":
+                    visible_text += part.get("text", "") or ""
+        elif isinstance(content, str) and _CHANNEL_OPEN in content and _CHANNEL_CLOSE in content:
+            # Pull existing channel block out of the string — pass it through.
+            head, _, tail = content.partition(_CHANNEL_OPEN)
+            chan, _, rest = tail.partition(_CHANNEL_CLOSE)
+            reasoning_text = chan
+            visible_text = (head + rest).strip()
+        elif isinstance(content, str):
+            visible_text = content
+
+        # No reasoning to render → fall back to the base layout. (No
+        # double-strip risk: visible_text was never set, so the base path
+        # sees the original message dict unchanged.)
+        if not reasoning_text:
+            return super().render_message(message, ctx=None)  # type: ignore[arg-type]
+
+        role = self._gemma_role_for(message)
+        header_str = f"{_TURN_OPEN}{role}\n"
+
+        body_parts: list[str] = [
+            f"{_CHANNEL_OPEN}{reasoning_text}{_CHANNEL_CLOSE}"
+        ]
+
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            for tc in tool_calls:
+                body_parts.append(_format_tool_call(tc))
+
+        tool_responses = message.get("tool_responses")
+        if tool_responses:
+            for tr in tool_responses:
+                body_parts.append(_format_tool_response(tr))
+
+        if visible_text:
+            body_parts.append(visible_text.strip())
+
+        if not self._is_tool_response_only(message):
+            body_parts.append(f"{_TURN_CLOSE}\n")
+        body_str = "".join(body_parts)
+
+        header = tinker.types.EncodedTextChunk(
+            tokens=self.tokenizer.encode(header_str, add_special_tokens=False),
+        )
+        output: list[tinker.ModelInputChunk] = [
+            tinker.types.EncodedTextChunk(
+                tokens=self.tokenizer.encode(body_str, add_special_tokens=False),
+            ),
+        ]
+        return RenderedMessage(header=header, output=output)
+
+
+def _gemma4_thinking_factory(
+    tokenizer: Tokenizer, image_processor=None
+) -> Gemma4ThinkingRenderer:
+    del image_processor
+    return Gemma4ThinkingRenderer(tokenizer)
+
+
+register_renderer("gemma4_thinking", _gemma4_thinking_factory)
